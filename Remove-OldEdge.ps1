@@ -68,7 +68,7 @@ trap {
 
 $script:StableGuid  = '56EB18F8-B008-4CBD-B6D2-8C97FE7E9062'
 $script:EdgeName    = 'Microsoft Edge'
-$script:ScriptVersion = '1.0.0'
+$script:ScriptVersion = '1.0.1'
 $script:IsAdmin     = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Issues      = New-Object System.Collections.Generic.List[string]
 $script:Results     = New-Object System.Collections.Generic.List[object]

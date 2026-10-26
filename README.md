@@ -125,10 +125,13 @@ Remove-OldEdge/
 ├── Remove-OldEdge.ps1   # 主脚本
 ├── README.md            # 本文档
 ├── CHANGELOG.md         # 变更记录
+├── LICENSE              # MIT 许可证
 ├── .gitattributes       # 换行符规范
 └── .gitignore
 ```
 
 ## 许可
 
-本仓库暂未附带开源许可证。如需开源发布，请自行添加 `LICENSE` 文件（例如 MIT）。
+本项目基于 [MIT License](LICENSE) 发布，Copyright (c) 2026 WindSnowLi。
+
+使用本脚本即表示你已理解：脚本会对系统自带的 Edge 稳定版做强制修改，风险由使用者自行承担。
