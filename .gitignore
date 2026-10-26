@@ -1,0 +1,13 @@
+# 运行产物
+*.log
+*.reg
+backup-*/
+*.msi
+*.exe
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
