@@ -2,6 +2,20 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [1.1.0] - 2026-10-28
+
+### 新增
+
+- 卸载稳定版后**自动下载并静默安装最新的 Microsoft Edge Canary**（默认开启，用 `-SkipCanaryInstall` 跳过），不再要求机器上事先存在替代浏览器
+- 安装包只从微软官方域名（`c2rsetup.edog.officeapps.live.com`）下载，执行前用 `Get-AuthenticodeSignature` 校验签名必须为 `Valid` 且签发者为 `Microsoft Corporation`，安装完成后删除安装包；下载失败会自动重试 3 次
+- 干净状态下运行也会补齐 Canary（已安装则跳过，不重复下载）
+- 关联重定向优先级更新：Canary（含 App Paths 登记与版本子目录探测）→ Beta → Dev → Chrome；未显式指定 `-TargetBrowser` 时优先使用刚安装的 Canary
+- 自检新增「Edge Canary 已安装」，安装失败时退出码为 `1`
+
+### 修复
+
+- 提权时 `-TargetBrowser` 未能传递给子进程（`Invoke-SelfElevate` 内误用 `$PSBoundParameters`，函数作用域下恒为空），导致提权后丢失重定向目标
+
 ## [1.0.1] - 2026-10-26
 
 ### 新增

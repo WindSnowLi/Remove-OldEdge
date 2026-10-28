@@ -9,13 +9,18 @@
       2. 备份相关注册表到日志目录，便于回滚
       3. 关闭 msedge 进程 -> 调用官方卸载 -> 强制清除残留文件
       4. 清理注册表：EdgeUpdate 客户端、卸载项、StartMenuInternet、RegisteredApplications、App Paths
-      5. 清理失效快捷方式（开始菜单 / 桌面 / 任务栏固定项）
-      6. 把仍指向已删路径的 http/https/microsoft-edge:/网页/PDF 关联重定向到可用的预览版浏览器
-      7. 删除稳定版的 EdgeUpdate 客户端登记，阻止 Edge 自动重装（更新器仍可服务其他通道）
-      8. 自检并输出结果；全程不重启、不动 WebView2 运行时、不删个人浏览器数据
+      5. 自动下载并静默安装最新的 Microsoft Edge Canary（可用 -SkipCanaryInstall 关闭）
+      6. 清理失效快捷方式（开始菜单 / 桌面 / 任务栏固定项）
+      7. 把仍指向已删路径的 http/https/microsoft-edge:/网页/PDF 关联重定向到 Canary 或其它可用浏览器
+      8. 删除稳定版的 EdgeUpdate 客户端登记，阻止 Edge 自动重装（更新器仍可服务其他通道）
+      9. 自检并输出结果；全程不重启、不动 WebView2 运行时、不删个人浏览器数据
 
 .PARAMETER TargetBrowser
-    关联重定向的目标浏览器 exe 路径。留空时自动探测 Canary / Beta / Dev / Chrome。
+    关联重定向的目标浏览器 exe 路径。留空时自动探测 Canary；仍无可用浏览器时使用刚安装的 Canary。
+
+.PARAMETER SkipCanaryInstall
+    跳过卸载后的「自动下载并静默安装最新 Edge Canary」（默认会自动安装）。
+    安装包只从微软官方域名下载，且必须通过 Authenticode 签名校验（Microsoft Corporation）才会执行。
 
 .PARAMETER DryRun
     只演练：显示将要执行的动作，不修改任何内容（无需管理员权限）。
@@ -47,6 +52,7 @@
 [CmdletBinding()]
 param(
     [string]$TargetBrowser,
+    [switch]$SkipCanaryInstall,
     [switch]$DryRun,
     [switch]$PurgeUserData,
     [string]$LogDirectory,
@@ -68,7 +74,16 @@ trap {
 
 $script:StableGuid  = '56EB18F8-B008-4CBD-B6D2-8C97FE7E9062'
 $script:EdgeName    = 'Microsoft Edge'
-$script:ScriptVersion = '1.0.1'
+$script:ScriptVersion = '1.1.0'
+$script:InstallCanary = -not [bool]$SkipCanaryInstall
+
+# Edge Canary（SxS 通道）官方引导安装包：始终下载当前最新版本
+$script:CanarySetupUrl = 'https://c2rsetup.edog.officeapps.live.com/c2r/downloadEdge.aspx?platform=X86&source=EdgeInsiderPage&Channel=Canary&language=en-US&brand=M103'
+$script:CanaryInstallRoots = @(
+    (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge SxS'),
+    'C:\Program Files (x86)\Microsoft\Edge SxS',
+    'C:\Program Files\Microsoft\Edge SxS'
+)
 $script:IsAdmin     = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Issues      = New-Object System.Collections.Generic.List[string]
 $script:Results     = New-Object System.Collections.Generic.List[object]
@@ -137,7 +152,8 @@ function Test-IsElevated {
 
 function Invoke-SelfElevate {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
-    if ($PSBoundParameters.ContainsKey('TargetBrowser') -and $TargetBrowser) { $argList += @('-TargetBrowser', ('"{0}"' -f $TargetBrowser)) }
+    if ($TargetBrowser) { $argList += @('-TargetBrowser', ('"{0}"' -f $TargetBrowser)) }
+    if (-not $script:InstallCanary) { $argList += '-SkipCanaryInstall' }
     if ($PurgeUserData) { $argList += '-PurgeUserData' }
     $argList += @('-LogDirectory', ('"{0}"' -f $script:LogDirectory))
     $argList += @('-LogFile', ('"{0}"' -f $script:LogFile))
@@ -263,11 +279,130 @@ function Get-StaleAssociations {
     return $stale
 }
 
+function Find-EdgeCanary {
+    <# 返回 Canary（Edge SxS）的 msedge.exe 路径；未安装时返回 $null #>
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($root in $script:CanaryInstallRoots) {
+        $app = Join-Path $root 'Application'
+        $candidates.Add((Join-Path $app 'msedge.exe'))
+        if (Test-Path -LiteralPath $app) {
+            Get-ChildItem -LiteralPath $app -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'msedge.exe') } |
+                ForEach-Object { $candidates.Add((Join-Path $_.FullName 'msedge.exe')) }
+        }
+    }
+    foreach ($k in @(
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe')) {
+        $v = (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).'(default)'
+        if ($v) {
+            $v = ([string]$v).Trim([char[]]@('"', ' '))
+            if ($v -like '*Edge SxS*Application*') { $candidates.Insert(0, $v) }
+        }
+    }
+    foreach ($c in $candidates) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+    return $null
+}
+
+function Save-CanaryInstaller {
+    <# 从微软官方域名下载 Canary 引导安装包，并校验 Authenticode 签名 #>
+    param([string]$Directory)
+
+    $file = Join-Path $Directory 'MicrosoftEdgeSetupCanary.exe'
+    Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    # Windows PowerShell 5.1 默认可能未启用 TLS 1.2
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $downloaded; $attempt++) {
+        Write-Log ("下载最新 Edge Canary 安装包（第 {0}/3 次）：{1}" -f $attempt, $script:CanarySetupUrl) 'STEP'
+        try {
+            Invoke-WebRequest -Uri $script:CanarySetupUrl -OutFile $file -UseBasicParsing -TimeoutSec 900 -ErrorAction Stop `
+                -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0' }
+            $size = if (Test-Path -LiteralPath $file) { (Get-Item -LiteralPath $file).Length } else { 0 }
+            if ($size -gt 500KB) {
+                Write-Log ("下载完成：{0}（{1:N1} MB）" -f $file, ($size / 1MB)) 'OK'
+                $downloaded = $true
+            } else {
+                Write-Log ("下载文件异常（{0} 字节），将重试" -f $size) 'WARN'
+            }
+        } catch {
+            Write-Log ("下载失败：{0}" -f $_.Exception.Message) 'WARN'
+            Start-Sleep -Seconds 3
+        }
+    }
+    if (-not $downloaded) {
+        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    $sig = $null
+    try { $sig = Get-AuthenticodeSignature -LiteralPath $file -ErrorAction Stop } catch { }
+    $subject = if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+    if (-not $sig -or $sig.Status -ne 'Valid' -or $subject -notlike '*O=Microsoft Corporation*') {
+        Write-Log ("安装包签名校验未通过（Status={0}），已放弃安装" -f $(if ($sig) { $sig.Status } else { 'N/A' })) 'ERR'
+        return $null
+    }
+    Write-Log ("安装包签名校验通过：{0}" -f $subject) 'OK'
+    return $file
+}
+
+function Install-EdgeCanary {
+    <# 确保系统上有最新的 Edge Canary：已安装则跳过，否则下载 -> 校验签名 -> 静默安装 #>
+    $existing = Find-EdgeCanary
+    if ($existing) {
+        $ver = try { (Get-Item -LiteralPath $existing).VersionInfo.ProductVersion } catch { '' }
+        Write-Log ("已安装 Edge Canary{0}，跳过下载安装：{1}" -f $(if ($ver) { " $ver" } else { '' }), $existing) 'OK'
+        Add-Result '安装最新 Edge Canary' $true $existing
+        return $existing
+    }
+
+    if ($DryRun) {
+        Write-Log '[DryRun] 将从微软官方下载最新 Edge Canary 安装包并静默安装（/silent /install）' 'STEP'
+        Add-Result '安装最新 Edge Canary' $true 'DryRun'
+        return $null
+    }
+
+    $installer = Save-CanaryInstaller -Directory $script:LogDirectory
+    if (-not $installer) {
+        Write-Log '无法获取可信任的 Edge Canary 安装包，跳过安装；可手动安装后重跑本脚本。' 'ERR'
+        Add-Result '安装最新 Edge Canary' $false '安装包下载或签名校验失败'
+        return $null
+    }
+
+    Write-Log ("静默安装 Edge Canary：`"{0}`" /silent /install" -f $installer) 'STEP'
+    try {
+        $p = Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -PassThru -Wait -ErrorAction Stop
+        Write-Log ("Edge Canary 安装程序退出码 {0}" -f $p.ExitCode) 'INFO'
+    } catch {
+        Write-Log ("Edge Canary 安装程序启动失败：{0}" -f $_.Exception.Message) 'ERR'
+    }
+
+    $canary = $null
+    foreach ($wait in @(2, 3, 5, 5, 10, 10, 15)) {
+        $canary = Find-EdgeCanary
+        if ($canary) { break }
+        Start-Sleep -Seconds $wait
+    }
+    if (-not $canary) {
+        Write-Log '未检测到 Edge Canary 安装结果，可手动安装后重跑本脚本。' 'ERR'
+        Add-Result '安装最新 Edge Canary' $false ("安装包保留在 " + $installer)
+        return $null
+    }
+
+    $ver = try { (Get-Item -LiteralPath $canary).VersionInfo.ProductVersion } catch { '' }
+    Write-Log ("Edge Canary 安装完成{0}：{1}" -f $(if ($ver) { "（$ver）" } else { '' }), $canary) 'OK'
+    Add-Result '安装最新 Edge Canary' $true ("$ver $canary").Trim()
+    Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    return $canary
+}
+
 function Find-TargetBrowser {
+    $canary = Find-EdgeCanary
+    if ($canary) { return $canary }
+
     $candidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge SxS\Application\msedge.exe'),
-        'C:\Program Files (x86)\Microsoft\Edge SxS\Application\msedge.exe',
-        'C:\Program Files\Microsoft\Edge SxS\Application\msedge.exe',
         (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge Beta\Application\msedge.exe'),
         'C:\Program Files (x86)\Microsoft\Edge Beta\Application\msedge.exe',
         (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge Dev\Application\msedge.exe'),
@@ -565,6 +700,10 @@ function Test-FinalState {
         $wv = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
         Add-Result 'WebView2 运行时保留' ($null -ne $wv) ([string]$wv.pv)
         if ($Browser) { Add-Result '替代浏览器可用' (Test-Path -LiteralPath $Browser) $Browser }
+        if ($script:InstallCanary) {
+            $canaryExe = Find-EdgeCanary
+            Add-Result 'Edge Canary 已安装' ($null -ne $canaryExe) ([string]$canaryExe)
+        }
     }
 }
 
@@ -574,7 +713,7 @@ Write-Host ''
 Write-Host '================ 移除旧版（稳定版）Microsoft Edge ================' -ForegroundColor Cyan
 Write-Log ("Remove-OldEdge v{0}" -f $script:ScriptVersion) 'INFO'
 Write-Log ("主机：{0}  Windows {1}" -f $env:COMPUTERNAME, [Environment]::OSVersion.Version) 'INFO'
-Write-Log ("管理员：{0}  DryRun：{1}" -f $script:IsAdmin, [bool]$DryRun) 'INFO'
+Write-Log ("管理员：{0}  DryRun：{1}  自动安装 Canary：{2}" -f $script:IsAdmin, [bool]$DryRun, [bool]$script:InstallCanary) 'INFO'
 
 Resolve-LogPaths
 
@@ -584,13 +723,19 @@ $workCount = $state.InstallRoots.Count + $state.ClientKeys.Count + $state.Uninst
 Write-Log ("探测结果：安装目录 {0} 个、可执行版本 {1} 个、EdgeUpdate 客户端 {2} 个、卸载项 {3} 个、幽灵登记 {4} 个" -f `
         $state.InstallRoots.Count, $state.Versions.Count, $state.ClientKeys.Count, $state.UninstallKeys.Count, $state.GhostKeys.Count) 'STEP'
 
+$targetBrowserPinned = [bool]$TargetBrowser
 if (-not $TargetBrowser) { $TargetBrowser = Find-TargetBrowser }
 
 if ($workCount -eq 0) {
     $staleOnly = @(Get-StaleAssociations)
     if ($staleOnly.Count -eq 0) {
         Write-Log '系统已经是干净状态：未发现稳定版 Edge 的文件、注册表登记或失效关联。' 'OK'
+        if ($script:InstallCanary -and -not (Find-EdgeCanary)) { $null = Install-EdgeCanary }
         Write-Host ''
+        if ($script:Issues.Count -gt 0) {
+            Write-Host 'Edge Canary 自动安装未完成，详见上方日志。' -ForegroundColor Yellow
+            exit 1
+        }
         Write-Host '无需任何操作。' -ForegroundColor Green
         exit 0
     }
@@ -624,6 +769,11 @@ for ($pass = 1; $pass -le 3; $pass++) {
     if ($leftClients -eq 0) { break }
     Write-Log ("第 {0} 轮清理后仍有 {1} 个稳定版 EdgeUpdate 登记，5 秒后重试" -f $pass, $leftClients) 'WARN'
     Start-Sleep -Seconds 5
+}
+
+if ($script:InstallCanary) {
+    $canary = Install-EdgeCanary
+    if ($canary -and -not $targetBrowserPinned) { $TargetBrowser = $canary }
 }
 
 Remove-DeadShortcuts -OldRoots $installRoots
